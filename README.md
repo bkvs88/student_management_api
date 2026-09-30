@@ -73,7 +73,8 @@ Host: localhost:8000
 ```
 
 ```json
-{"id": 2, "name": "Kumar", "age": 38, "city": "Singapore"}
+{"id": 2, "name": "Kumar", "age": 38, "city": "Singapore",
+ "email": "kumar@example.com", "course": "Data Science"}
 ```
 
 - **Request line** — the *method* (`GET`), the *path* (`/students/2`), the protocol.
@@ -113,6 +114,8 @@ class StudentCreate(BaseModel):
     name: str = Field(min_length=2, max_length=50)
     age: int = Field(ge=0, le=100)
     city: str = Field(min_length=2, max_length=50)
+    email: EmailStr
+    course: str = Field(min_length=2, max_length=50)
 ```
 
 Before your function body ever runs, FastAPI validates the incoming JSON
@@ -120,6 +123,16 @@ against this class. If a client sends `{"name": "A", "age": 999}`, validation
 fails and the client gets **HTTP 422** with a precise list of what was wrong —
 your function is never called. This is a large amount of manual code you do not
 have to write.
+
+Two of those five fields are worth calling out:
+
+- `email: EmailStr` is not `str`. `EmailStr` is a Pydantic type that checks the
+  address is shaped like an email, so `"not-an-email"` is rejected with 422
+  before your handler runs.
+- `course` carries a `@field_validator`, which runs **after** the field's own
+  constraints and can rewrite the value. Here it collapses internal whitespace,
+  so `"Data  Science"` is stored as `"Data Science"` and differently spaced
+  spellings of one course stay one value.
 
 ### c) Type hints drive everything
 
@@ -281,7 +294,7 @@ for status, populate a dropdown.
 **Example from this project.**
 
 ```python
-@app.get("/studentsdata")
+@app.get("/students")
 def get_students_data():
     with SessionLocal() as session:
         result = session.execute(text("SELECT * from students order by id"))
@@ -293,8 +306,10 @@ def get_students_data():
 
 ```json
 [
-  {"id": 1, "name": "Kumar", "age": 38, "city": "Singapore"},
-  {"id": 2, "name": "Venkat", "age": 34, "city": "India"}
+  {"id": 1, "name": "Kumar", "age": 38, "city": "Singapore",
+   "email": "kumar@example.com", "course": "Data Science"},
+  {"id": 2, "name": "Venkat", "age": 34, "city": "India",
+   "email": "venkat@example.com", "course": "Machine Learning"}
 ]
 ```
 
@@ -317,12 +332,21 @@ sending a message.
 **Example from this project.**
 
 ```python
-@app.post("/students/{student_id}")
+@app.post("/students", status_code=201)
 def create_student(student: StudentCreate):
     with SessionLocal() as session:
         session.execute(
-            text("INSERT INTO students (name, age, city) VALUES (:name, :age, :city)"),
-            {"name": student.name, "age": student.age, "city": student.city},
+            text(
+                "INSERT INTO students (name, age, city, email, course) "
+                "VALUES (:name, :age, :city, :email, :course)"
+            ),
+            {
+                "name": student.name,
+                "age": student.age,
+                "city": student.city,
+                "email": str(student.email),
+                "course": student.course,
+            },
         )
         session.commit()
     return {"message": "Student created successfully"}
@@ -331,12 +355,18 @@ def create_student(student: StudentCreate):
 **Request**
 
 ```json
-{"name": "Sravan", "age": 21, "city": "Hyderabad"}
+{"name": "Sravan", "age": 21, "city": "Hyderabad",
+ "email": "sravan@example.com", "course": "Data Science"}
 ```
 
-**Note the `{student_id}` in the path is ignored.** By REST convention, a
-creation endpoint should be `POST /students` with no id, returning **201
-Created** with the new resource's URL.
+Note the two details that make this RESTful: the path is `POST /students` with
+**no id** (the id is the database's to assign, not the client's), and the
+decorator declares `status_code=201` so a successful create answers **201
+Created** rather than the 200 default.
+
+`str(student.email)` looks redundant but is not: `EmailStr` is a Pydantic
+subclass of `str`, and casting it to a plain `str` is what makes it a value the
+database driver accepts.
 
 ---
 
@@ -366,14 +396,47 @@ known complete state, idempotent bulk operations.
 ```python
 @app.put("/students/{student_id}")
 def update_student(student_id: int, student: StudentCreate):
-    session.execute(
-        text("UPDATE students SET name = :name, age = :age, city = :city WHERE id = :id"),
-        {"name": student.name, "age": student.age, "city": student.city, "id": student_id},
-    )
-    session.commit()
+    try:
+        with SessionLocal() as session:
+            try:
+                result = session.execute(
+                    text(
+                        "UPDATE students SET name = :name, age = :age, city = :city, "
+                        "email = :email, course = :course WHERE id = :id"
+                    ),
+                    {
+                        "name": student.name,
+                        "age": student.age,
+                        "city": student.city,
+                        "email": str(student.email),
+                        "course": student.course,
+                        "id": student_id,
+                    },
+                )
+                updated = result.rowcount
+                if updated:
+                    session.commit()
+            except IntegrityError:
+                session.rollback()
+                raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating student: {e}")
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return {"message": "Student updated successfully"}
 ```
 
-All three fields are always written, so this is a true full replace.
+All five fields are always written, so this is a true full replace.
+
+The `updated = result.rowcount` line is the one that makes 404 work: `UPDATE` on
+an id that does not exist matches **zero** rows without raising anything, so
+without the check the handler would report success for a student it never
+touched. Two further details are load-bearing and easy to drop: the commit is
+inside `if updated`, and the 404 is raised **after** the `try` block so the
+broad `except Exception` cannot convert it to a 500.
 
 ---
 
@@ -397,14 +460,21 @@ class studentpatch(BaseModel):
     name: str | None = Field(default=None, min_length=2, max_length=50)
     age: int | None = Field(default=None, ge=0, le=100)
     city: str | None = Field(default=None, min_length=2, max_length=50)
+    email: EmailStr | None = None
+    course: str | None = Field(default=None, min_length=2, max_length=50)
 
 @app.patch("/students/{student_id}")
 def patch_student(student_id: int, student: studentpatch):
     update_data = {k: v for k, v in student.dict().items() if v is not None}
+    if "email" in update_data:
+        update_data["email"] = str(update_data["email"])
     if update_data:
         set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
         update_data["id"] = student_id
-        session.execute(text(f"UPDATE students SET {set_clause} WHERE id = :id"), update_data)
+        session.execute(
+            text(f"UPDATE students SET {set_clause} WHERE id = :id"),
+            update_data
+        )
         session.commit()
 ```
 
@@ -416,11 +486,17 @@ def patch_student(student_id: int, student: studentpatch):
 
 **What happens, step by step:**
 
-1. `name` and `age` are `None`, so the dict comprehension drops them.
+1. `name`, `age`, `email` and `course` are `None`, so the dict comprehension
+   drops them.
 2. `update_data == {"city": "Bengaluru"}`.
 3. `set_clause == "city = :city"`.
 4. The SQL becomes `UPDATE students SET city = :city WHERE id = :id`.
-5. `name` and `age` in the database are untouched.
+5. The other four columns in the database are untouched.
+
+Note that the SQL string is built by interpolating **column names** from the
+model's own keys, while the **values** stay as bound parameters. That split is
+why this is still safe: the keys come from the Pydantic model, never from the
+request body, so a client cannot invent a column to write to.
 
 This is why the code has a **separate PATCH endpoint** and a **separate
 `studentpatch` model** instead of reusing `StudentCreate`: PUT's model requires
@@ -438,19 +514,38 @@ all fields, PATCH's makes them all optional.
 **Example from this project.**
 
 ```python
-@app.delete("/students/{student_id}")
+@app.delete("/students/{student_id}", status_code=204)
 def delete_student(student_id: int):
-    with SessionLocal() as session:
-        session.execute(
-            text("DELETE FROM students WHERE id = :id"), {"id": student_id}
-        )
-        session.commit()
-    return {"message": "Student deleted successfully"}
+    try:
+        with SessionLocal() as session:
+            result = session.execute(
+                text("DELETE FROM students WHERE id = :id"),
+                {"id": student_id},
+            )
+            deleted = result.rowcount
+            if deleted:
+                session.commit()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting student: {e}")
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Student not found")
 ```
 
-By REST convention this should return **204 No Content** with an empty body, and
-a missing id should return **404**. Here it returns 200 with a message either
-way.
+Two conventions are in play here:
+
+- `status_code=204` on the decorator makes a successful delete answer **204 No
+  Content**, which by definition carries **no body**. That is why the handler
+  returns nothing at all — returning a `{"message": ...}` dict would contradict
+  the status code it just declared.
+- Deleting an id that does not exist is a **404**, decided by `rowcount`, for
+  the same reason as PUT: a `DELETE` matching zero rows raises nothing on its
+  own.
+
+The `except Exception` wrapper is not shown here, but note where the 404 is
+raised — **after** the `try` block. That placement is what stops the broad
+handler from catching its own deliberate 404 and re-reporting it as a 500. See
+[7.11](#711-error-handling).
 
 ---
 
@@ -501,16 +596,32 @@ OpenAPI docs you will see `OPTIONS` listed for every path.
 `422` is FastAPI's own choice and is worth internalising: a Pydantic
 `HTTPException`-free validation failure returns 422 *before* your code runs.
 
+### What this project actually returns
+
+| Request | Status |
+| --- | --- |
+| `GET /students` | 200 |
+| `GET /students/{id}` — exists / missing | 200 / 404 |
+| `POST /students` — valid / bad body / duplicate email | 201 / 422 / 409 |
+| `PUT /students/{id}` — exists / missing / duplicate email | 200 / 404 / 409 |
+| `PATCH /students/{id}` — valid / bad body / duplicate email | 200 / 422 / 409 |
+| `DELETE /students/{id}` — exists / missing | 204 / 404 |
+
+One gap worth naming: `PATCH` is the only write route here that does not check
+whether the student exists, so patching an unknown id still returns 200. It is
+listed correctly in the table above as what the code does, not as what it should
+do.
+
 ---
 
 ## 7. Walkthrough of `student_mgmt.py`
 
-### 7.1 The module docstring (lines 1–22)
+### 7.1 The module docstring (lines 1–23)
 
 Documents what the module is, the full route table, the storage, and how to run
 it. This is the first thing a new teammate reads.
 
-### 7.2 Setup and configuration (lines 24–39)
+### 7.2 Setup and configuration (lines 34–46)
 
 ```python
 load_dotenv()
@@ -518,6 +629,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+DUPLICATE_EMAIL_DETAIL = "Email already registered"
 ```
 
 - `load_dotenv()` reads the `.env` file and puts the variables into the
@@ -531,8 +643,12 @@ Base = declarative_base()
   when you call `session.commit()`. This is how you get transactions.
 - `Base = declarative_base()` defines where ORM models would be registered.
   **No model is mapped to it in this file** — the routes use raw SQL.
+- `DUPLICATE_EMAIL_DETAIL` is a fixed message returned for any unique-constraint
+  violation. The driver's own text names the index and the failing SQL, which is
+  noise for a client, so the detail stays constant instead of interpolating the
+  original error.
 
-### 7.3 The connection check (lines 42–64)
+### 7.3 The connection check (lines 49–71)
 
 ```python
 def check_database_connection():
@@ -553,7 +669,7 @@ network path work. Crucially, this is called **at import time**, not inside a
 request. If the database is unreachable, you find out when the server starts,
 rather than when a user gets a 500.
 
-### 7.4 Creating the app (line 66)
+### 7.4 Creating the app (line 73)
 
 ```python
 app = FastAPI(title="API Marketplace", description="Market place for API", version="1.0.0")
@@ -581,8 +697,21 @@ Read this as three parts:
    validates the value from the URL before calling the function.
 
 Because the literal part comes first, FastAPI can reliably distinguish
-`/studentsdata` from `/students/2`. Route order still matters if two templates
+`/Test API` from `/students/2`. Route order still matters if two templates
 could both match.
+
+You can also declare the success status directly on the decorator, which two
+routes do:
+
+```python
+@app.post("/students", status_code=201)
+@app.delete("/students/{student_id}", status_code=204)
+```
+
+`status_code` sets the status FastAPI sends on **success**. It does not affect
+error responses — raising `HTTPException(404)` still returns 404 even on the
+route declared as 204, because the exception handler builds that response
+separately.
 
 ### 7.6 The session lifecycle
 
@@ -636,21 +765,45 @@ if not student:
 
 `.first()` returns the first row **or `None`**. The `if not student` guard turns
 "no result" into a proper 404. This is the standard FastAPI idiom for a
-not-found response. In the current code that guard sits *inside* the `try`
-block, so the `except Exception` below catches the 404 it just raised and
-reports it as a 500.
+not-found response.
 
-### 7.9 Input validation (lines 156–171)
+**Where that guard sits is the whole trick.** It has to be *after* the `try` /
+`except` pair, not inside the `try`:
+
+```python
+try:
+    with SessionLocal() as session:
+        student = session.execute(...).mappings().first()
+except Exception as e:
+    raise HTTPException(status_code=500, detail=f"Error fetching student data: {e}")
+
+if not student:                                     # outside the try
+    raise HTTPException(status_code=404, detail="Student not found")
+```
+
+Inside the `try`, the `except Exception` catches the 404 the guard just raised
+and re-reports it as a 500 — the client gets
+`500 "Error fetching student data: 404: Student not found"` for a student that
+simply does not exist. See [7.11](#711-error-handling).
+
+### 7.9 Input validation (lines 160–193)
 
 ```python
 class StudentCreate(BaseModel):
     name: str = Field(min_length=2, max_length=50)
     age: int = Field(ge=0, le=100)
     city: str = Field(min_length=2, max_length=50)
+    email: EmailStr
+    course: str = Field(min_length=2, max_length=50)
+
+    @field_validator("course")
+    @classmethod
+    def normalise_course(cls, v: str) -> str:
+        return " ".join(v.split())
 ```
 
 ```python
-@app.post("/students/{student_id}")
+@app.post("/students", status_code=201)
 def create_student(student: StudentCreate):
 ```
 
@@ -668,8 +821,8 @@ otherwise be a hand-written `if` in every handler.
 
 ### 7.10 The PUT vs PATCH decision, again in the code
 
-`update_student` (line 207) takes `StudentCreate` — every field required, all
-three always written. `patch_student` (line 250) takes `studentpatch` — every
+`update_student` (line 244) takes `StudentCreate` — every field required, all
+five always written. `patch_student` (line 324) takes `studentpatch` — every
 field `Optional` with `default=None`, and it filters out the `None` values
 before building SQL. That single difference in the model type is the entire
 difference between the two HTTP verbs in this program.
@@ -684,9 +837,38 @@ except Exception as e:
 `HTTPException` is how you tell FastAPI "return this status code with this
 message". It is the correct tool for a 404 or a 409.
 
-However, `except Exception` is a **very** broad net — it also catches the
-`HTTPException` you raised on purpose, which is how a deliberate 404 turns into
-a 500 here.
+However, `except Exception` is a **very** broad net — and `HTTPException` is an
+`Exception`, so the handler catches the 404 you raised on purpose and reports it
+as a 500. Two ways out, both used in this file:
+
+1. **Raise deliberate status codes outside the `try`.** The 404 in
+   `get_student_by_id`, `update_student` and `delete_student` all sit after the
+   `except`, so the broad net never sees them.
+2. **Re-raise `HTTPException` untouched.** Where the check has to happen inside
+   the `try` — the 409s — the handler catches it separately and passes it on:
+
+   ```python
+   try:
+       with SessionLocal() as session:
+           try:
+               session.execute(...)
+               session.commit()
+           except IntegrityError:
+               session.rollback()
+               raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
+   except HTTPException:
+       raise                       # let the 409 through unchanged
+   except Exception as e:
+       raise HTTPException(status_code=500, detail=f"Error creating student: {e}")
+   ```
+
+   The outer `except HTTPException: raise` is the part that matters. Without it
+   the outer `except Exception` would still turn that careful 409 into a 500.
+
+Two habits make this reliable: keep `except` clauses **narrowest first** (the
+specific `IntegrityError` or `HTTPException` before the general `Exception`),
+and **always `session.rollback()`** before raising, so the failed transaction
+does not stay open.
 
 ---
 
@@ -699,41 +881,78 @@ pip install -r requirements.txt
 # 2. make sure .env contains DATABASE_URL, e.g.
 #    DATABASE_URL=postgresql://user:password@host:5432/dbname
 
-# 3. start the server
+# 3. make sure the students table has the columns the code writes
+#    (see "The students table" below)
+
+# 4. start the server
 uvicorn student_mgmt:app --reload
 ```
 
-Then open:
+### The students table
+
+The code writes six columns, so the table needs all six:
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `integer` | Primary key, serial |
+| `name` | `varchar` | |
+| `age` | `integer` | |
+| `city` | `varchar` | |
+| `email` | `varchar(255)` | **Unique**, nullable |
+| `course` | `varchar(100)` | Nullable |
+
+If you are starting from a table that only has the first four, add the rest:
+
+```sql
+ALTER TABLE students ADD COLUMN email VARCHAR(255);
+ALTER TABLE students ADD COLUMN course VARCHAR(100);
+CREATE UNIQUE INDEX students_email_key ON students (email) WHERE email IS NOT NULL;
+```
+
+Both columns are nullable, so existing rows survive and read back with `null`
+for the two new fields. The index is **partial** (`WHERE email IS NOT NULL`)
+because in SQL a `UNIQUE` constraint treats every `NULL` as distinct, so the
+existing null rows would not collide anyway — the partial form just states the
+intent instead of relying on that.
+
+You do not need to run this by hand if the table is already set up; it is
+documented here so the schema the code assumes is written down somewhere.
+
+### Then open the docs
 
 - **<http://127.0.0.1:8000/docs>** — interactive Swagger UI, generated from the
   docstrings and `Field` constraints in the code
 - <http://127.0.0.1:8000/redoc> — ReDoc rendering
+- <http://127.0.0.1:8000/Test%20API> — a static greeting, useful as a
+  smoke test that the server is up at all
 
 ### Try it with curl
 
 ```bash
 # list all students
-curl http://127.0.0.1:8000/studentsdata
+curl http://127.0.0.1:8000/students
 
-# fetch one
+# fetch one  -> 200, or 404 if no such id
 curl http://127.0.0.1:8000/students/2
 
-# create (note: student_id in the path is ignored)
-curl -X POST http://127.0.0.1:8000/students/0 \
+# create  -> 201, or 422 on a bad body, 409 if the email is taken
+curl -X POST http://127.0.0.1:8000/students \
      -H "Content-Type: application/json" \
-     -d '{"name": "Sravan", "age": 21, "city": "Hyderabad"}'
+     -d '{"name": "Sravan", "age": 21, "city": "Hyderabad",
+          "email": "sravan@example.com", "course": "Data Science"}'
 
 # partial update — only city changes
 curl -X PATCH http://127.0.0.1:8000/students/2 \
      -H "Content-Type: application/json" \
      -d '{"city": "Bengaluru"}'
 
-# full replace
+# full replace — all five fields required
 curl -X PUT http://127.0.0.1:8000/students/2 \
      -H "Content-Type: application/json" \
-     -d '{"name": "Kumar", "age": 39, "city": "Singapore"}'
+     -d '{"name": "Kumar", "age": 39, "city": "Singapore",
+          "email": "kumar@example.com", "course": "Machine Learning"}'
 
-# delete
+# delete  -> 204 with no body, or 404 if already gone
 curl -X DELETE http://127.0.0.1:8000/students/2
 ```
 
@@ -763,6 +982,12 @@ student_management_api/
   `PUT` to replace, `PATCH` to modify in place, `DELETE` to remove — and relies
   on Pydantic to validate input and on SQLAlchemy sessions to talk to
   PostgreSQL safely with parameterised SQL.
+- **Status codes are part of the contract, not decoration.** `201` on create,
+  `204` on delete, `404` for a student that does not exist, `409` for a
+  duplicate email, `422` for a bad body. Most of that comes from two details
+  that are easy to miss: a write that matched zero rows has to check `rowcount`
+  to notice, and a deliberate `HTTPException` has to be raised outside the broad
+  `except Exception` that would otherwise turn it into a 500.
 
 Happy learning. The fastest way to internalise all of this is to keep the app
 running, hit every endpoint in `/docs`, and change one thing at a time.

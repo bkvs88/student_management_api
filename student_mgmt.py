@@ -14,9 +14,10 @@ Routes exposed by this module:
     PATCH  /students/{id}     - update only the supplied fields.
     DELETE /students/{id}     - delete a student by primary key.
 
-Storage is the pre-existing ``students`` table (id, name, age, city) in the
-database named by ``DATABASE_URL`` in the .env file. Queries are written as
-raw parameterised SQL via ``text()`` rather than through the ORM.
+Storage is the pre-existing ``students`` table (id, name, age, city, email,
+course) in the database named by ``DATABASE_URL`` in the .env file. Queries are
+written as raw parameterised SQL via ``text()`` rather than through the ORM.
+``email`` is unique across the table.
 
 Run with: uvicorn student_mgmt:app --reload
 """
@@ -26,6 +27,7 @@ import os
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 # Reads DATABASE_URL (and any other keys) from the .env file next to this module.
@@ -37,6 +39,11 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 # Declared for future use: the routes below query with raw SQL, so no ORM model
 # is currently mapped onto it.
 Base = declarative_base()
+
+# Returned verbatim for any unique-constraint violation. The driver message
+# behind it names the index and the SQL, which is noise for a client, so the
+# detail stays fixed rather than interpolating the original error.
+DUPLICATE_EMAIL_DETAIL = "Email already registered"
 
 
 def check_database_connection():
@@ -85,7 +92,8 @@ def get_students_data():
     query, so callers must not depend on it.
 
     Returns:
-        list[dict]: One dict per student, each holding id, name, age and city.
+        list[dict]: One dict per student, each holding id, name, age, city,
+            email and course.
 
     Note:
         The ``except`` below catches query failures as well as connection
@@ -116,7 +124,8 @@ def get_student_by_id(student_id: int):
         student_id: Primary key of the student to look up.
 
     Returns:
-        dict: The matching row as a dict of column names to values.
+        dict: The matching row as a dict of column names to values: id, name,
+            age, city, email and course.
 
     Raises:
         HTTPException: 404 if no student has that id, or 500 if the lookup fails.
@@ -155,15 +164,31 @@ class StudentCreate(BaseModel):
         name: Student name, 2-50 characters.
         age: Student age, 0-100 inclusive.
         city: City of residence, 2-50 characters.
+        email: Contact address, checked by ``EmailStr`` for an ``@`` and a
+            domain. Must be unique across the table.
+        course: Enrolled course, 2-50 characters, normalised by
+            ``normalise_course``.
 
     Note:
-        ``EmailStr``, ``HttpUrl`` and ``field_validator`` are imported for
-        validation helpers that are not used by this model yet.
+        ``HttpUrl`` remains imported but unused: none of these fields is a URL.
     """
 
     name: str = Field(min_length=2, max_length=50)
     age: int = Field(ge=0, le=100)
     city: str = Field(min_length=2, max_length=50)
+    email: EmailStr
+    course: str = Field(min_length=2, max_length=50)
+
+    @field_validator("course")
+    @classmethod
+    def normalise_course(cls, v: str) -> str:
+        """Collapse internal whitespace in a course name.
+
+        So "  Data  Science " is stored as "Data Science", which keeps
+        differently spaced spellings of the same course in one value.
+        """
+
+        return " ".join(v.split())
 
 
 @app.post("/students", status_code=201)
@@ -174,7 +199,8 @@ def create_student(student: StudentCreate):
     the database. The route is POST on /students, so there is no id in the path.
 
     Args:
-        student: Validated name, age and city of the student to add.
+        student: Validated name, age, city, email and course of the student to
+            add.
 
     Returns:
         dict: A success message, sent with status 201 Created as declared on
@@ -183,17 +209,33 @@ def create_student(student: StudentCreate):
             follow-up GET.
 
     Raises:
-        HTTPException: 500 if the insert fails, e.g. on a constraint violation.
+        HTTPException: 409 if the email is already taken, or 500 if the insert
+            fails for any other reason.
     """
 
     try:
         with SessionLocal() as session:
-            session.execute(
-                text("INSERT INTO students (name, age, city) VALUES (:name, :age, :city)"),
-                {"name": student.name, "age": student.age, "city": student.city},
-            )
-            session.commit()
+            try:
+                session.execute(
+                    text(
+                        "INSERT INTO students (name, age, city, email, course) "
+                        "VALUES (:name, :age, :city, :email, :course)"
+                    ),
+                    {
+                        "name": student.name,
+                        "age": student.age,
+                        "city": student.city,
+                        "email": str(student.email),
+                        "course": student.course,
+                    },
+                )
+                session.commit()
+            except IntegrityError:
+                session.rollback()
+                raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
         return {"message": "Student created successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating student: {e}")
 
@@ -204,27 +246,43 @@ def update_student(student_id: int, student: StudentCreate):
 
     Args:
         student_id: Primary key of the student to update.
-        student: The new name, age and city. All three are always written, so
-            this is a full replace rather than a partial update.
+        student: The new name, age, city, email and course. All five are always
+            written, so this is a full replace rather than a partial update.
 
     Returns:
         dict: A success message, sent with status 200 as declared on the route
             decorator. Only returned when a row was actually updated.
 
     Raises:
-        HTTPException: 404 if no student has that id, or 500 if the update
-            fails.
+        HTTPException: 404 if no student has that id, 409 if the email is
+            already taken by another student, or 500 if the update fails.
     """
 
     try:
         with SessionLocal() as session:
-            result = session.execute(
-                text("UPDATE students SET name = :name, age = :age, city = :city WHERE id = :id"),
-                {"name": student.name, "age": student.age, "city": student.city, "id": student_id},
-            )
-            updated = result.rowcount
-            if updated:
-                session.commit()
+            try:
+                result = session.execute(
+                    text(
+                        "UPDATE students SET name = :name, age = :age, city = :city, "
+                        "email = :email, course = :course WHERE id = :id"
+                    ),
+                    {
+                        "name": student.name,
+                        "age": student.age,
+                        "city": student.city,
+                        "email": str(student.email),
+                        "course": student.course,
+                        "id": student_id,
+                    },
+                )
+                updated = result.rowcount
+                if updated:
+                    session.commit()
+            except IntegrityError:
+                session.rollback()
+                raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating student: {e}")
 
@@ -240,11 +298,26 @@ class studentpatch(BaseModel):
         name: New name, or None to leave the stored value untouched.
         age: New age, or None to leave the stored value untouched.
         city: New city, or None to leave the stored value untouched.
+        email: New address, or None to leave the stored value untouched.
+        course: New course, or None to leave the stored value untouched.
     """
 
     name: str | None = Field(default=None, min_length=2, max_length=50)
     age: int | None = Field(default=None, ge=0, le=100)
     city: str | None = Field(default=None, min_length=2, max_length=50)
+    email: EmailStr | None = None
+    course: str | None = Field(default=None, min_length=2, max_length=50)
+
+    @field_validator("course")
+    @classmethod
+    def normalise_course(cls, v: str | None) -> str | None:
+        """Collapse internal whitespace, leaving None alone.
+
+        None means "do not touch this field", so it has to survive the
+        normalisation untouched.
+        """
+
+        return None if v is None else " ".join(v.split())
 
 
 @app.patch("/students/{student_id}")
@@ -258,19 +331,22 @@ def patch_student(student_id: int, student: studentpatch):
 
     Args:
         student_id: Primary key of the student to update.
-        student: Any subset of name, age and city.
+        student: Any subset of name, age, city, email and course.
 
     Returns:
         dict: A success message. The updated row is not read back, so the
             response does not show the new values.
 
     Raises:
-        HTTPException: 500 if the update fails.
+        HTTPException: 409 if the email is already taken by another student,
+            otherwise 500 if the update fails.
     """
 
     try:
         with SessionLocal() as session:
             update_data = {k: v for k, v in student.dict().items() if v is not None}
+            if "email" in update_data:
+                update_data["email"] = str(update_data["email"])
             if update_data:
                 set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
                 update_data["id"] = student_id
@@ -280,6 +356,8 @@ def patch_student(student_id: int, student: studentpatch):
                 )
                 session.commit()
         return {"message": "Student patched successfully"}
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error patching student: {e}")
 
