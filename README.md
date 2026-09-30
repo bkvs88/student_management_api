@@ -600,7 +600,7 @@ OpenAPI docs you will see `OPTIONS` listed for every path.
 
 | Request | Status |
 | --- | --- |
-| `GET /students` | 200 |
+| `GET /students` — ok / query fails | 200 / 500 |
 | `GET /students/{id}` — exists / missing | 200 / 404 |
 | `POST /students` — valid / bad body / duplicate email | 201 / 422 / 409 |
 | `PUT /students/{id}` — exists / missing / duplicate email | 200 / 404 / 409 |

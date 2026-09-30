@@ -93,13 +93,10 @@ def get_students_data():
 
     Returns:
         list[dict]: One dict per student, each holding id, name, age, city,
-            email and course.
+            email and course. An empty table gives an empty list, not None.
 
-    Note:
-        The ``except`` below catches query failures as well as connection
-        failures, so its "Database connection failed" message is misleading for
-        a malformed or missing table. It also returns None in that case, which
-        FastAPI serialises as a null body.
+    Raises:
+        HTTPException: 500 if the query fails.
     """
 
     try:
@@ -108,12 +105,17 @@ def get_students_data():
             students = [dict(row) for row in result.mappings()]
             return students
     except Exception as e:
-        print(f"Database connection failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching students: {e}")
 
 
 # Warm the query path at import time so a broken table is noticed on startup.
-# The result is discarded.
-get_students_data()
+# The result is discarded. The HTTPException is caught here on purpose: the
+# route now raises instead of returning None, and an uncaught one here would
+# propagate out of the import and leave the server unable to start at all.
+try:
+    get_students_data()
+except HTTPException as e:
+    print(f"Startup student query failed: {e.detail}")
 
 
 @app.get("/students/{student_id}")
