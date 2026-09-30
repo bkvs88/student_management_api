@@ -120,14 +120,6 @@ def get_student_by_id(student_id: int):
 
     Raises:
         HTTPException: 404 if no student has that id, or 500 if the lookup fails.
-
-    Note:
-        ``except Exception`` also matches ``HTTPException``, so the 404 raised
-        above for a missing student is caught and re-wrapped as a 500 with
-        detail "Error fetching student data: 404: Student not found". The
-        documented 404 status therefore never reaches the client; to emit a
-        clean 404 the raise would need to sit outside the try, or be re-raised
-        untouched via ``except HTTPException: raise``.
     """
 
     try:
@@ -136,11 +128,12 @@ def get_student_by_id(student_id: int):
                 text("SELECT * FROM students WHERE id = :id"), {"id": student_id}
             )
             student = result.mappings().first()
-        if not student:
-            raise HTTPException(status_code=404, detail="Student not found")
-        return student
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching student data: {e}")
+
+    if not student:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return student
 
 
 # --- Request payloads ---------------------------------------------------------
@@ -173,7 +166,7 @@ class StudentCreate(BaseModel):
     city: str = Field(min_length=2, max_length=50)
 
 
-@app.post("/students")
+@app.post("/students", status_code=201)
 def create_student(student: StudentCreate):
     """Insert a new student.
 
@@ -184,11 +177,10 @@ def create_student(student: StudentCreate):
         student: Validated name, age and city of the student to add.
 
     Returns:
-        dict: A success message, sent with status 200. The decorator passes no
-            ``status_code``, so FastAPI's default 200 is used rather than the
-            201 Created that a resource-creating POST conventionally returns.
-            The generated id is also absent from the response, so a client
-            cannot learn which row it just created without a follow-up GET.
+        dict: A success message, sent with status 201 Created as declared on
+            the route decorator. The generated id is absent from the response,
+            so a client cannot learn which row it just created without a
+            follow-up GET.
 
     Raises:
         HTTPException: 500 if the insert fails, e.g. on a constraint violation.
@@ -286,7 +278,7 @@ def patch_student(student_id: int, student: studentpatch):
         raise HTTPException(status_code=500, detail=f"Error patching student: {e}")
 
 
-@app.delete("/students/{student_id}")
+@app.delete("/students/{student_id}", status_code=204)
 def delete_student(student_id: int):
     """Delete a student by primary key.
 
@@ -294,13 +286,11 @@ def delete_student(student_id: int):
         student_id: Primary key of the student to remove.
 
     Returns:
-        dict: A success message, sent with status 200 and a body. The decorator
-            passes no ``status_code``, so a delete here answers 200 with
-            ``{"message": "Student deleted successfully"}`` instead of the
-            conventional 204 No Content, which is defined to carry no body.
-            Deleting an id that does not exist is not an error either: the
-            DELETE simply matches no rows and still reports success, because
-            the affected row count is not checked.
+        None: A 204 No Content response, which carries no body, so there is
+            no message to report. Deleting an id that does not exist is not an
+            error here either: the DELETE simply matches no rows and still
+            answers 204, because the affected row count is not checked and the
+            empty response leaves the client no way to tell the two apart.
 
     Raises:
         HTTPException: 500 if the delete fails.
@@ -313,6 +303,5 @@ def delete_student(student_id: int):
                 {"id": student_id},
             )
             session.commit()
-        return {"message": "Student deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting student: {e}")
