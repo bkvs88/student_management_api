@@ -9,7 +9,7 @@ Routes exposed by this module:
     GET    /Test API          - static greeting, for smoke-testing the app.
     GET    /students          - list every row of the ``students`` table.
     GET    /students/{id}     - fetch one student by primary key.
-    POST   /students     - insert a student (the path id is ignored).
+    POST   /students          - insert a student.
     PUT    /students/{id}     - replace a student's details by primary key.
     PATCH  /students/{id}     - update only the supplied fields.
     DELETE /students/{id}     - delete a student by primary key.
@@ -122,10 +122,12 @@ def get_student_by_id(student_id: int):
         HTTPException: 404 if no student has that id, or 500 if the lookup fails.
 
     Note:
-        The 404 is raised inside the ``try`` block, so the ``except`` clause
-        catches it and re-raises a 500 instead. A missing student therefore
-        comes back as 500 with "Error fetching student data: 404: Student not
-        found" rather than a clean 404.
+        ``except Exception`` also matches ``HTTPException``, so the 404 raised
+        above for a missing student is caught and re-wrapped as a 500 with
+        detail "Error fetching student data: 404: Student not found". The
+        documented 404 status therefore never reaches the client; to emit a
+        clean 404 the raise would need to sit outside the try, or be re-raised
+        untouched via ``except HTTPException: raise``.
     """
 
     try:
@@ -176,17 +178,17 @@ def create_student(student: StudentCreate):
     """Insert a new student.
 
     The ``id`` column is left to its sequence default, so rows are numbered by
-    the database. Note that the route is declared as POST on /students/{id} but
-    the ``student_id`` path parameter is not part of the function signature, so
-    it is ignored entirely.
+    the database. The route is POST on /students, so there is no id in the path.
 
     Args:
         student: Validated name, age and city of the student to add.
 
     Returns:
-        dict: A success message. The generated id is not returned or set in the
-            response, so a client cannot learn which row it just created
-            without a follow-up GET.
+        dict: A success message, sent with status 200. The decorator passes no
+            ``status_code``, so FastAPI's default 200 is used rather than the
+            201 Created that a resource-creating POST conventionally returns.
+            The generated id is also absent from the response, so a client
+            cannot learn which row it just created without a follow-up GET.
 
     Raises:
         HTTPException: 500 if the insert fails, e.g. on a constraint violation.
@@ -292,9 +294,13 @@ def delete_student(student_id: int):
         student_id: Primary key of the student to remove.
 
     Returns:
-        dict: A success message. Deleting an id that does not exist is not an
-            error here: the DELETE simply matches no rows and still reports
-            success, because the affected row count is not checked.
+        dict: A success message, sent with status 200 and a body. The decorator
+            passes no ``status_code``, so a delete here answers 200 with
+            ``{"message": "Student deleted successfully"}`` instead of the
+            conventional 204 No Content, which is defined to carry no body.
+            Deleting an id that does not exist is not an error either: the
+            DELETE simply matches no rows and still reports success, because
+            the affected row count is not checked.
 
     Raises:
         HTTPException: 500 if the delete fails.
