@@ -14,10 +14,23 @@ Routes exposed by this module:
     PATCH  /students/{id}     - update only the supplied fields.
     DELETE /students/{id}     - delete a student by primary key.
 
-Storage is the pre-existing ``students`` table (id, name, age, city, email,
-course) in the database named by ``DATABASE_URL`` in the .env file. Queries are
-written as raw parameterised SQL via ``text()`` rather than through the ORM.
-``email`` is unique across the table.
+Storage is the ``students`` table (id, name, age, city, email, course) in the
+database named by ``DATABASE_URL`` in the .env file. Queries are written as raw
+parameterised SQL via ``text()`` rather than through the ORM. ``email`` is unique
+across the table.
+
+**This module creates and migrates nothing.** It issues no ``CREATE TABLE``, no
+``ALTER TABLE``, and calls neither ``Base.metadata.create_all()`` nor Alembic. The
+schema is expected to already exist, and this file is not what puts it there, so
+a fresh database will fail every route with 500 until the table is created
+manually. The ``students`` definition this code assumes is:
+
+    id     integer     primary key, serial
+    name   varchar     not null
+    age    integer     not null
+    city   varchar     not null
+    email  varchar     unique, nullable
+    course varchar     nullable
 
 Run with: uvicorn student_mgmt:app --reload
 """
@@ -37,7 +50,9 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Declared for future use: the routes below query with raw SQL, so no ORM model
-# is currently mapped onto it.
+# is currently mapped onto it. Note that this is also why nothing here creates
+# the schema — a declarative base only defines models, and an empty one produces
+# no DDL. There is no create_all() call and no migration script in this project.
 Base = declarative_base()
 
 # Returned verbatim for any unique-constraint violation. The driver message
@@ -108,10 +123,12 @@ def get_students_data():
         raise HTTPException(status_code=500, detail=f"Error fetching students: {e}")
 
 
-# Warm the query path at import time so a broken table is noticed on startup.
-# The result is discarded. The HTTPException is caught here on purpose: the
-# route now raises instead of returning None, and an uncaught one here would
+# Warm the query path at import time so a missing or broken table is noticed on
+# startup. The result is discarded. The HTTPException is caught here on purpose:
+# the route raises rather than returning None, and an uncaught one here would
 # propagate out of the import and leave the server unable to start at all.
+# Since this module creates no schema, this is also the earliest point a missing
+# ``students`` table can be reported.
 try:
     get_students_data()
 except HTTPException as e:
@@ -328,8 +345,8 @@ def patch_student(student_id: int, student: studentpatch):
 
     Fields left as None are filtered out, and the SQL SET clause is built from
     the remaining keys, so omitted fields keep their stored values. When every
-    field is None the update is skipped entirely and the stored row is left
-    untouched.
+    field is None no UPDATE is issued at all, and the handler falls back to a
+    plain existence check so an unknown id is still reported as missing.
 
     Args:
         student_id: Primary key of the student to update.
@@ -340,28 +357,45 @@ def patch_student(student_id: int, student: studentpatch):
             response does not show the new values.
 
     Raises:
-        HTTPException: 409 if the email is already taken by another student,
-            otherwise 500 if the update fails.
+        HTTPException: 404 if no student has that id, 409 if the email is
+            already taken by another student, otherwise 500 if the update
+            fails.
     """
 
     try:
         with SessionLocal() as session:
-            update_data = {k: v for k, v in student.dict().items() if v is not None}
-            if "email" in update_data:
-                update_data["email"] = str(update_data["email"])
-            if update_data:
-                set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
-                update_data["id"] = student_id
-                session.execute(
-                    text(f"UPDATE students SET {set_clause} WHERE id = :id"),
-                    update_data
-                )
-                session.commit()
-        return {"message": "Student patched successfully"}
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
+            try:
+                update_data = {k: v for k, v in student.dict().items() if v is not None}
+                if "email" in update_data:
+                    update_data["email"] = str(update_data["email"])
+                if update_data:
+                    set_clause = ", ".join([f"{k} = :{k}" for k in update_data.keys()])
+                    update_data["id"] = student_id
+                    result = session.execute(
+                        text(f"UPDATE students SET {set_clause} WHERE id = :id"),
+                        update_data
+                    )
+                    patched = result.rowcount
+                else:
+                    # Nothing to write, so no UPDATE runs and there is no
+                    # rowcount to inspect. Confirm the row is at least there.
+                    patched = session.execute(
+                        text("SELECT count(*) FROM students WHERE id = :id"),
+                        {"id": student_id},
+                    ).scalar()
+                if patched:
+                    session.commit()
+            except IntegrityError:
+                session.rollback()
+                raise HTTPException(status_code=409, detail=DUPLICATE_EMAIL_DETAIL)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error patching student: {e}")
+
+    if not patched:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return {"message": "Student patched successfully"}
 
 
 @app.delete("/students/{student_id}", status_code=204)
