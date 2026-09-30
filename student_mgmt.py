@@ -7,9 +7,9 @@ the student routes directly on the ``app`` instance.
 Routes exposed by this module:
 
     GET    /Test API          - static greeting, for smoke-testing the app.
-    GET    /studentsdata      - list every row of the ``students`` table.
+    GET    /students          - list every row of the ``students`` table.
     GET    /students/{id}     - fetch one student by primary key.
-    POST   /students/{id}     - insert a student (the path id is ignored).
+    POST   /students     - insert a student (the path id is ignored).
     PUT    /students/{id}     - replace a student's details by primary key.
     PATCH  /students/{id}     - update only the supplied fields.
     DELETE /students/{id}     - delete a student by primary key.
@@ -76,7 +76,7 @@ def test_api():
     return "Welcome to API Market"
 
 
-@app.get("/studentsdata")
+@app.get("/students")
 def get_students_data():
     """Return every row of the ``students`` table.
 
@@ -171,7 +171,7 @@ class StudentCreate(BaseModel):
     city: str = Field(min_length=2, max_length=50)
 
 
-@app.post("/students/{student_id}")
+@app.post("/students")
 def create_student(student: StudentCreate):
     """Insert a new student.
 
