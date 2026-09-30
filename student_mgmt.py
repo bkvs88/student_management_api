@@ -208,23 +208,29 @@ def update_student(student_id: int, student: StudentCreate):
             this is a full replace rather than a partial update.
 
     Returns:
-        dict: A success message. It reports success even when the update
-            matched no rows, because no row count is checked.
+        dict: A success message, sent with status 200 as declared on the route
+            decorator. Only returned when a row was actually updated.
 
     Raises:
-        HTTPException: 500 if the update fails.
+        HTTPException: 404 if no student has that id, or 500 if the update
+            fails.
     """
 
     try:
         with SessionLocal() as session:
-            session.execute(
+            result = session.execute(
                 text("UPDATE students SET name = :name, age = :age, city = :city WHERE id = :id"),
                 {"name": student.name, "age": student.age, "city": student.city, "id": student_id},
             )
-            session.commit()
-        return {"message": "Student updated successfully"}
+            updated = result.rowcount
+            if updated:
+                session.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error updating student: {e}")
+
+    if not updated:
+        raise HTTPException(status_code=404, detail="Student not found")
+    return {"message": "Student updated successfully"}
 
 
 class studentpatch(BaseModel):
@@ -286,22 +292,25 @@ def delete_student(student_id: int):
         student_id: Primary key of the student to remove.
 
     Returns:
-        None: A 204 No Content response, which carries no body, so there is
-            no message to report. Deleting an id that does not exist is not an
-            error here either: the DELETE simply matches no rows and still
-            answers 204, because the affected row count is not checked and the
-            empty response leaves the client no way to tell the two apart.
+        None: A 204 No Content response, which carries no body, so there is no
+            message to report. Returned only when a row was actually deleted.
 
     Raises:
-        HTTPException: 500 if the delete fails.
+        HTTPException: 404 if no student has that id, or 500 if the delete
+            fails.
     """
 
     try:
         with SessionLocal() as session:
-            session.execute(
+            result = session.execute(
                 text("DELETE FROM students WHERE id = :id"),
                 {"id": student_id},
             )
-            session.commit()
+            deleted = result.rowcount
+            if deleted:
+                session.commit()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error deleting student: {e}")
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Student not found")
